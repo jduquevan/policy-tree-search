@@ -1,0 +1,24 @@
+batch_size: 10
+input_dim: 5
+frontier_size: 1
+max_tree_depth: 4
+num_iterations: 100000
+gamma: 0.96
+rollout_length: 16
+lam: 0.97
+vf_coef: 1
+learning_rate: 1e-4
+tree_lr: 1e-3
+
+mlp:
+  # for the first MLP
+  num_layers: 2
+  features: 64
+
+gru:
+  hidden_dim: 64
+
+output_mlp:
+  # for the final MLP
+  num_layers: 1
+  features: 64
