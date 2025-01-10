@@ -184,6 +184,7 @@ def single_step_reinforce_update(
     updated_params, updated_states = jax.vmap(per_example_update)(params1, grads_all, opt_state1)
     return updated_params, updated_states
 
+@partial(jax.jit, static_argnums=(2,3))
 def expand_frontier_once(
     frontier,
     agent_params2,  # unbatched param for agent2
@@ -354,7 +355,7 @@ def evaluate_frontier_batched(
     # But also let's return the other arrays for debugging/logging.
     return returns, br_returns, ent1_all, ent2_all
 
-@partial(jax.jit, static_argnums=(2,3,7))
+@partial(jax.jit, static_argnums=(2, 3, 5, 7))
 def train_best_response_batched(
     br_params: Dict,         # best-response parameters
     frontier_params: Dict,   # shape (F, ...) frontier policies
@@ -469,29 +470,20 @@ def policy_tree_search(
     rng_key: jax.random.PRNGKey,
     cfg: DictConfig,
 ):
-    """
-    A simplified policy-tree search that:
-      1) Expands a frontier of agent policies.
-      2) Trains best_response in a batched manner.
-      3) Evaluates each frontier policy.
-      4) Selects the best policy => new agent_params.
-      5) Logs to W&B each iteration.
-    """
-
-    frontier_size = cfg.frontier_size     # Typically 1 if you're branching from a single policy
+    frontier_size = cfg.frontier_size
     max_depth     = cfg.max_tree_depth
     num_iters     = cfg.num_iterations
+    num_steps     = cfg.rollout_length
 
     gamma   = cfg.gamma
     lam     = cfg.lam
     vf_coef = cfg.vf_coef
-    num_steps = cfg.rollout_length
 
     for iteration in range(num_iters):
         # A) Create the initial frontier
         frontier = {
             "N": frontier_size,
-            "params1": replicate_params(agent_params, frontier_size),   
+            "params1": replicate_params(agent_params, frontier_size),
             "opt_state1": replicate_opt_state(opt_state_agent, frontier_size),
             "h1": jnp.zeros((frontier_size, agent.gru_hidden_dim)),
             "state": jnp.zeros((frontier_size, 2)),
@@ -501,41 +493,57 @@ def policy_tree_search(
         # B) Expand the frontier
         frontier = policy_tree_batched(
             frontier,
-            br_params,  # best_response params
+            br_params,
             agent, best_response,
             max_depth=max_depth,
             gamma=gamma,
             lr=cfg.tree_lr
         )
-        # => frontier["params1"] has shape (frontier_size * 2^max_depth, ...)
 
-        # C) Train the best_response on these frontier policies
+        # C) Multiple best-response updates
         rng_key, br_rng = jax.random.split(rng_key)
-        (br_params, opt_state_br, br_loss, br_metrics) = train_best_response_batched(
-            br_params,
-            frontier["params1"],  # Just the PyTree
-            best_response,
-            agent,
-            opt_state_br,
-            optimizer,
-            br_rng,
-            num_steps=num_steps,
-            gamma=gamma,
-            lam=lam,
-            vf_coef=vf_coef
-        )
+        current_br_params = br_params
+        current_opt_state_br = opt_state_br
+        current_key = br_rng
 
-        # D) Evaluate each frontier policy => get returns
+        for br_iter in range(cfg.num_br_updates):
+            current_key, subkey = jax.random.split(current_key)
+            (current_br_params,
+             current_opt_state_br,
+             br_loss,
+             br_metrics
+            ) = train_best_response_batched(
+                current_br_params,
+                frontier["params1"],
+                best_response,
+                agent,
+                current_opt_state_br,
+                optimizer,
+                subkey,
+                num_steps=num_steps,
+                gamma=gamma,
+                lam=lam,
+                vf_coef=vf_coef
+            )
+            # optional: wandb.log({"br_iter_loss": float(br_loss), "br_iter": br_iter})
+
+        # Update global br_params & opt_state_br
+        br_params = current_br_params
+        opt_state_br = current_opt_state_br
+
+        # D) Evaluate each frontier policy
         rng_key, eval_key = jax.random.split(rng_key)
-        returns, br_returns, ent1_all, ent2_all = evaluate_frontier_batched(
-            frontier["params1"],  # Just the PyTree
+        (returns,
+         br_returns,
+         ent1_all,
+         ent2_all) = evaluate_frontier_batched(
+            frontier["params1"],
             br_params,
             agent,
             best_response,
             eval_key,
             num_steps
         )
-        # returns => shape (frontier_size * 2^max_depth,)
 
         # E) Pick best policy
         best_idx = jnp.argmax(returns)
@@ -548,8 +556,7 @@ def policy_tree_search(
         # F) Update agent_params => best policy
         agent_params = best_policy
 
-        # ---- LOGGING ----
-        # Let's log both to console and wandb.
+        # Logging
         print(f"[Iter {iteration+1}/{num_iters}] BR loss = {float(br_loss):.4f}, best frontier return = {float(best_return):.4f}")
         wandb.log({
             "iteration": iteration + 1,

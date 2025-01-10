@@ -6,9 +6,10 @@ num_iterations: 100000
 gamma: 0.96
 rollout_length: 16
 lam: 0.97
-vf_coef: 1
-learning_rate: 1e-4
+vf_coef: 0.1
+learning_rate: 1e-5
 tree_lr: 1e-3
+num_br_updates: 1
 
 mlp:
   # for the first MLP
