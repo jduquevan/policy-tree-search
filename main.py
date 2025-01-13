@@ -113,26 +113,73 @@ def ipd(a1_single, a2_single):
     r2 = oh2 @ mat @ oh1
     return r1, r2
 
-def ipd_step(state, a1, a2):
+def ipd_step(state, a1, a2, rollout_length=5):
+    """
+    state: shape (3,) => (old_a1, old_a2, t) [unbatched version]
+    a1, a2: new actions
+    returns (next_state, r1, r2, done)
+    """
+    old_a1, old_a2, t = state
+
+    # Compute IPD rewards from new (a1, a2)
     r1, r2 = ipd(a1, a2)
-    next_state = jnp.stack([a1, a2], axis=-1)
-    done = jnp.zeros_like(a1, dtype=bool)
+
+    new_t = t + 1
+    done = (new_t == rollout_length)  # <-- single boolean now
+
+    reset_state = jnp.array([-1, -1, 0], dtype=jnp.int32)
+    candidate_state = jnp.array([a1, a2, new_t], dtype=jnp.int32)
+
+    # OLD (batched): next_state = jnp.where(done[:, None], reset_state, candidate_state)
+    next_state = jnp.where(done, reset_state, candidate_state)
     return next_state, r1, r2, done
 
 # ------------------------------------------------------------------------
 # Batched IPD step, used by policy tree search
 # ------------------------------------------------------------------------
-def ipd_step_batch(states: jnp.ndarray, a1: jnp.ndarray, a2: jnp.ndarray):
+def ipd_step_batch(states, a1, a2, rollout_length=5):
     """
-    states: (N,2)
-    a1, a2: (N,) actions
-    returns next_states, r1, r2, done => each (N,) or (N,2)
+    states: (N,3) => the last element is the step counter
+    a1, a2: (N,) new actions
+    returns next_states, r1, r2, done
+      next_states: shape (N,3)
+      r1, r2: (N,)
+      done: (N,) boolean
     """
+    # Parse
+    old_a1 = states[:, 0]
+    old_a2 = states[:, 1]
+    t      = states[:, 2]
 
+    # Compute IPD payoff
     r1, r2 = jax.vmap(ipd)(a1, a2)
-    next_states = jnp.stack([a1, a2], axis=-1)  # (N,2)
-    done = jnp.zeros_like(a1, dtype=bool)
+
+    new_t = t + 1
+    done = (new_t == rollout_length)  # shape (N,)
+
+    # next_state if not done => [a1, a2, new_t], else => [-1, -1, 0]
+    reset_state = jnp.array([-1, -1, 0], dtype=jnp.int32)  # shape (3,)
+    candidate   = jnp.stack([a1, a2, new_t], axis=-1)      # shape (N,3)
+
+    # We'll broadcast reset_state up to (N,3) so we can do a where
+    reset_state_broadcast = jnp.tile(reset_state[None, :], (states.shape[0], 1))  # shape (N,3)
+
+    # jnp.where(condition, x, y) => picks x where cond is True, else y
+    next_states = jnp.where(done[:, None], reset_state_broadcast, candidate)
+
     return next_states, r1, r2, done
+
+def always_cooperate_action(_rng_key, _obs):
+    """
+    Returns action=0 (Cooperate).
+    """
+    return 0
+
+def always_defect_action(_rng_key, _obs):
+    """
+    Returns action=1 (Defect).
+    """
+    return 1
 
 @partial(jax.jit, static_argnums=(2,))
 def single_step_reinforce_update(
@@ -154,8 +201,8 @@ def single_step_reinforce_update(
     Return (updated_params[i], updated_opt_state[i]) for i in [0..N-1].
     """
     def loss_fn(p, s_i, h_i, a_i, r_i, ns_i, nh_i):
-        val_s, logits_s, _ = agent1.apply({"params": p}, s_i, h_i)
-        val_ns, _, _       = agent1.apply({"params": p}, ns_i, nh_i)
+        val_s, logits_s, _ = agent1.apply({"params": p}, s_i[0:2], h_i)
+        val_ns, _, _       = agent1.apply({"params": p}, ns_i[0:2], nh_i)
 
         advantage = r_i + gamma * val_ns - val_s
         log_probs = jax.nn.log_softmax(logits_s)
@@ -220,7 +267,7 @@ def expand_frontier_once(
 
     # --- (B) agent1 forward => top-2
     def agent1_forward(params1_i, state_i, h1_i):
-        val1, logits1, new_h1 = agent1.apply({"params": params1_i}, state_i, h1_i)
+        val1, logits1, new_h1 = agent1.apply({"params": params1_i}, state_i[0:2], h1_i)
         top_vals, top_actions = jax.lax.top_k(logits1, k=2)
         return top_actions, new_h1
 
@@ -266,11 +313,11 @@ def expand_frontier_once(
 
     # --- (F) new hidden states
     def forward_agent1(params1_i, s_i, h_i):
-        _, _, new_h = agent1.apply({"params": params1_i}, s_i, h_i)
+        _, _, new_h = agent1.apply({"params": params1_i}, s_i[0:2], h_i)
         return new_h
 
     def forward_agent2(params2, s_i, h_i):
-        val, logits, new_h = agent2.apply({"params": params2}, s_i, h_i)
+        val, logits, new_h = agent2.apply({"params": params2}, s_i[0:2], h_i)
         return new_h
 
     new_h1_2N = jax.vmap(forward_agent1)(updated_params1_2N, next_state_2N, next_h1_2N)
@@ -309,7 +356,7 @@ def evaluate_frontier_batched(
 ):
     F = get_batch_size(frontier_params)
     rng_keys = jax.random.split(rng_key, F)
-    init_states = jnp.tile(jnp.array([0.0, 0.0]), (F, 1))
+    init_states = jnp.tile(jnp.array([0.0, 0.0, 0.0]), (F, 1))
     init_h1 = jnp.zeros((F, agent.gru_hidden_dim))
     init_h2 = jnp.zeros((F, best_response.gru_hidden_dim))
 
@@ -378,7 +425,7 @@ def train_best_response_batched(
     F = get_batch_size(frontier_params)
     rng_keys = jax.random.split(rng_key, F)
 
-    init_states = jnp.tile(jnp.array([0.0, 0.0]), (F, 1))
+    init_states = jnp.tile(jnp.array([0.0, 0.0, 0.0]), (F, 1))
     init_h1 = jnp.zeros((F, agent.gru_hidden_dim))
     init_h2 = jnp.zeros((F, best_response.gru_hidden_dim))
 
@@ -567,6 +614,17 @@ def policy_tree_search(
             "best_response_entropy": float(best_response_entropy),
         })
 
+        # Evaluation
+        if (iteration + 1) % cfg.eval_every == 0:
+            evaluate_against_fixed_opponents(
+                agent_params=agent_params,
+                br_params=br_params,
+                agent_module=agent,
+                br_module=best_response,
+                rng_key=rng_key,
+                cfg=cfg
+            )
+
     return agent_params, br_params
 
 def actor_critic_loss(
@@ -607,7 +665,7 @@ def actor_critic_loss(
     # Define forward pass for the agent
     def agent_forward(carry, s):
         h = carry
-        value, logits, new_h = agent.apply({"params": agent_params}, s, h)
+        value, logits, new_h = agent.apply({"params": agent_params}, s[0:2], h)
         return new_h, (value, logits)
 
     # Run the agent forward over the entire trajectory
@@ -664,12 +722,13 @@ def generate_trajectory_functional(
         (env_s, h1, h2, rng_key) = carry
 
         def agent_forward(agent, params, state, hidden_state):
-            val, logits, new_h = agent.apply({"params": params}, state, hidden_state)
+            val, logits, new_h = agent.apply({"params": params}, state[0:2], hidden_state)
             return  val, logits, new_h
 
         obs1 = env_s
+        obs1 = env_s[0:2]
         # For agent2: flip => [env_s[1], env_s[0]]
-        obs2 = jnp.array([env_s[..., 1], env_s[..., 0]])
+        obs2 = jnp.array([obs1[..., 1], obs1[..., 0]])
 
         value1, logits1, new_h1 = agent_forward(agent1, agent1_params, obs1, h1)
         value2, logits2, new_h2 = agent_forward(agent2, agent2_params, obs2, h2)
@@ -682,8 +741,9 @@ def generate_trajectory_functional(
         a2_f = a2.astype(jnp.float32)
 
         # Step environment => [a1,a2]
-        next_env_s, r1, r2, done = ipd_step(env_s, a1, a2)
-        next_env_s = jnp.stack([a1_f, a2_f], axis=-1)
+        next_env_s, r1, r2, done = ipd_step(env_s, a1, a2, rollout_length=num_steps)
+        t_f = next_env_s[-1].astype(jnp.float32)
+        next_env_s = jnp.stack([a1_f, a2_f, t_f], axis=-1)
 
         # --- CHANGE: Store logits1 and logits2 in the transition
         transition = {
@@ -728,6 +788,99 @@ def replicate_params(params, N):
     
     return jax.tree_map(replicate_leaf, params)
 
+def evaluate_agent_vs_fixed_action(
+    agent_params,
+    agent_module,
+    fixed_action_fn,
+    rng_key,
+    num_steps=5
+):
+    """
+    Runs a single rollout of length num_steps, with (agent vs. fixed_action_fn).
+    Returns (agent_return, fixed_opponent_return).
+    """
+    env_s = jnp.array([0.0, 0.0, 0.0])  # IPD initial state
+    h_agent = jnp.zeros((agent_module.gru_hidden_dim,))
+
+    # We'll collect the cumulative reward for each side
+    agent_return = 0.0
+    fixed_return = 0.0
+
+    def agent_forward(params, obs, hidden):
+        val, logits, new_h = agent_module.apply({"params": params}, obs[0:2], hidden)
+        return val, logits, new_h
+
+    carry_rng = rng_key
+    for _ in range(num_steps):
+        # (1) Agent picks action
+        carry_rng, subkey = jax.random.split(carry_rng)
+        val_agent, logits_agent, new_h_agent = agent_forward(agent_params, env_s, h_agent)
+        a_agent = jax.random.categorical(subkey, logits_agent)
+
+        # (2) Fixed action is always 0 or 1:
+        a_fixed = fixed_action_fn(carry_rng, env_s)
+
+        # (3) Step the IPD environment
+        next_s, rA, rF, done = ipd_step(env_s, a_agent, a_fixed)
+
+        # Update cumulative returns
+        agent_return += rA
+        fixed_return += rF
+
+        # Update agent hidden state and env state
+        env_s = next_s
+        h_agent = new_h_agent
+
+    return agent_return, fixed_return
+
+def evaluate_against_fixed_opponents(agent_params, br_params, agent_module, br_module, rng_key, cfg):
+    """
+    Evaluate both agent_module and br_module vs. Always-Cooperate and Always-Defect.
+    Log the results to wandb.
+    """
+    # Split RNGs for each matchup
+    rng_key, ac_agent_key = jax.random.split(rng_key)
+    rng_key, ad_agent_key = jax.random.split(rng_key)
+    rng_key, ac_br_key    = jax.random.split(rng_key)
+    rng_key, ad_br_key    = jax.random.split(rng_key)
+
+    # 1) Agent vs. Always-Cooperate
+    agent_vs_coop_rA, coop_r  = evaluate_agent_vs_fixed_action(
+        agent_params, agent_module, always_cooperate_action,
+        ac_agent_key, cfg.rollout_length
+    )
+
+    # 2) Agent vs. Always-Defect
+    agent_vs_def_rA, def_r    = evaluate_agent_vs_fixed_action(
+        agent_params, agent_module, always_defect_action,
+        ad_agent_key, cfg.rollout_length
+    )
+
+    # 3) Best-Response vs. Always-Cooperate
+    br_vs_coop_rB, coop_r2    = evaluate_agent_vs_fixed_action(
+        br_params, br_module, always_cooperate_action,
+        ac_br_key, cfg.rollout_length
+    )
+
+    # 4) Best-Response vs. Always-Defect
+    br_vs_def_rB, def_r2      = evaluate_agent_vs_fixed_action(
+        br_params, br_module, always_defect_action,
+        ad_br_key, cfg.rollout_length
+    )
+
+    # Log these to wandb
+    wandb.log({
+        "agent_vs_AC": float(agent_vs_coop_rA),
+        "AC_return_vs_agent": float(coop_r),
+        "agent_vs_AD": float(agent_vs_def_rA),
+        "AD_return_vs_agent": float(def_r),
+
+        "br_vs_AC": float(br_vs_coop_rB),
+        "AC_return_vs_br": float(coop_r2),
+        "br_vs_AD": float(br_vs_def_rB),
+        "AD_return_vs_br": float(def_r2),
+    })
+
 @hydra.main(
     version_base=None,
     config_path="/home/mila/j/juan.duque/projects/policy-tree-search/configs",
@@ -739,26 +892,26 @@ def main(cfg: DictConfig):
 
     # 2) Instantiate agent and best_response (same GRUModule architecture)
     agent = GRUModule(
-        mlp_num_layers=2,
-        mlp_features=32,
-        gru_hidden_dim=32,
-        final_mlp_num_layers=2,
-        final_mlp_features=32,
+        mlp_num_layers=cfg.mlp.num_layers,
+        mlp_features=cfg.mlp.features,
+        gru_hidden_dim=cfg.gru.hidden_dim,
+        final_mlp_num_layers=cfg.output_mlp.num_layers,
+        final_mlp_features=cfg.output_mlp.features,
         action_dim=2
     )
     best_response = GRUModule(
-        mlp_num_layers=2,
-        mlp_features=32,
-        gru_hidden_dim=32,
-        final_mlp_num_layers=2,
-        final_mlp_features=32,
+        mlp_num_layers=cfg.mlp.num_layers,
+        mlp_features=cfg.mlp.features,
+        gru_hidden_dim=cfg.gru.hidden_dim,
+        final_mlp_num_layers=cfg.output_mlp.num_layers,
+        final_mlp_features=cfg.output_mlp.features,
         action_dim=2
     )
 
     # 3) Initialize parameters
     rng = jax.random.PRNGKey(cfg.get("seed", 42))
     x_init = jnp.array([0.0, 0.0]) 
-    h_init = jnp.zeros((32,))
+    h_init = jnp.zeros((cfg.gru.hidden_dim,))
     agent_params = agent.init(rng, x_init, h_init)["params"]
     br_params    = best_response.init(rng, x_init, h_init)["params"]
 
