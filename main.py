@@ -6,7 +6,7 @@ import wandb
 
 from flax import linen as nn
 from functools import partial
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from typing import Dict
 
 
@@ -193,7 +193,8 @@ def single_step_reinforce_update(
     next_s,
     next_h,
     gamma=0.99,
-    lr=1e-2
+    lr=1e-2,
+    agent_entropy_beta=0.01,
 ):
     """
     We'll compute advantage per example, then do a per-example update:
@@ -208,7 +209,9 @@ def single_step_reinforce_update(
         log_probs = jax.nn.log_softmax(logits_s)
         logp_a    = log_probs[a_i]
 
-        policy_loss = -logp_a * advantage
+        entropy   = compute_entropy_from_logits(logits_s)
+
+        policy_loss = -logp_a * advantage - agent_entropy_beta * entropy
         target = r_i + gamma * val_ns
         value_loss = (val_s - target) ** 2
 
@@ -236,7 +239,8 @@ def expand_frontier_once(
     frontier,
     agent_params2,  # unbatched param for agent2
     agent1, agent2,
-    gamma=0.99, lr=1e-2
+    gamma=0.99, lr=1e-2,
+    agent_entropy_beta=0.01,
 ):
     """
     frontier keys:
@@ -308,7 +312,8 @@ def expand_frontier_once(
         next_state_2N,       # next_s
         next_h1_2N,          # next_h
         gamma=gamma,
-        lr=lr
+        lr=lr,
+        agent_entropy_beta=agent_entropy_beta,
     )
 
     # --- (F) new hidden states
@@ -325,6 +330,10 @@ def expand_frontier_once(
         forward_agent2,
         in_axes=(None, 0, 0)
     )(agent_params2, next_state_2N, next_h2_2N)
+
+    # --- RESET HIDDEN STATES WHERE done_2N IS TRUE ---
+    new_h1_2N = jnp.where(done_2N[:, None], jnp.zeros_like(new_h1_2N), new_h1_2N)
+    new_h2_2N = jnp.where(done_2N[:, None], jnp.zeros_like(new_h2_2N), new_h2_2N)
 
     # Build new frontier
     new_frontier = {
@@ -415,6 +424,7 @@ def train_best_response_batched(
     gamma: float,
     lam: float,
     vf_coef: float,
+    br_entropy_beta: float = 0.01, 
 ):
     """
     1) Generate 1 rollout per frontier policy vs. current BR.
@@ -474,7 +484,8 @@ def train_best_response_batched(
             br_traj,
             gamma=gamma,
             lam=lam,
-            vf_coef=vf_coef
+            vf_coef=vf_coef,
+            entropy_beta=br_entropy_beta,
         )
         return total_loss, metrics
 
@@ -491,7 +502,8 @@ def policy_tree_batched(
     agent1, agent2,
     max_depth=1,
     gamma=0.99,
-    lr=1e-2
+    lr=1e-2,
+    agent_entropy_beta=0.01,
 ):
     """
     Repeats expand_frontier_once for max_depth steps.
@@ -502,7 +514,8 @@ def policy_tree_batched(
         frontier = expand_frontier_once(
             frontier, agent_params2,
             agent1, agent2,
-            gamma=gamma, lr=lr
+            gamma=gamma, lr=lr,
+            agent_entropy_beta=agent_entropy_beta,
         )
     return frontier
 
@@ -544,7 +557,8 @@ def policy_tree_search(
             agent, best_response,
             max_depth=max_depth,
             gamma=gamma,
-            lr=cfg.tree_lr
+            lr=cfg.tree_lr,
+            agent_entropy_beta=cfg.agent_entropy_beta
         )
 
         # C) Multiple best-response updates
@@ -570,7 +584,8 @@ def policy_tree_search(
                 num_steps=num_steps,
                 gamma=gamma,
                 lam=lam,
-                vf_coef=vf_coef
+                vf_coef=vf_coef,
+                br_entropy_beta=cfg.br_entropy_beta,
             )
             # optional: wandb.log({"br_iter_loss": float(br_loss), "br_iter": br_iter})
 
@@ -633,7 +648,8 @@ def actor_critic_loss(
     trajectory: Dict[str, jnp.ndarray],
     gamma: float = 0.99, 
     lam: float = 0.95, 
-    vf_coef: float = 0.5
+    vf_coef: float = 0.5,
+    entropy_beta: float = 0.01,
 ):
     """Actor-critic loss function for a single GRU-based agent.
 
@@ -689,8 +705,12 @@ def actor_critic_loss(
     # Value loss: MSE between predicted values and returns
     value_loss = jnp.mean((ret - vals)**2)
 
+    # Entropy
+    entropy = compute_entropy_from_logits(logs)
+    avg_entropy = jnp.mean(entropy)
+
     # Combine losses with value loss scaled by vf_coef
-    total_loss = policy_loss + vf_coef * value_loss
+    total_loss = policy_loss + vf_coef * value_loss - entropy_beta * avg_entropy
 
     # Metrics for logging/monitoring
     metrics = {
@@ -744,6 +764,10 @@ def generate_trajectory_functional(
         next_env_s, r1, r2, done = ipd_step(env_s, a1, a2, rollout_length=num_steps)
         t_f = next_env_s[-1].astype(jnp.float32)
         next_env_s = jnp.stack([a1_f, a2_f, t_f], axis=-1)
+
+        # --- RESET GRU HIDDEN STATES IF done ---
+        new_h1 = jnp.where(done, jnp.zeros_like(new_h1), new_h1)
+        new_h2 = jnp.where(done, jnp.zeros_like(new_h2), new_h2)
 
         # --- CHANGE: Store logits1 and logits2 in the transition
         transition = {
@@ -888,7 +912,7 @@ def evaluate_against_fixed_opponents(agent_params, br_params, agent_module, br_m
 )
 def main(cfg: DictConfig):
     # 1) Initialize wandb
-    wandb.init(project="policy-tree-search")
+    wandb.init(project="policy-tree-search", config=OmegaConf.to_container(cfg, resolve=True))
 
     # 2) Instantiate agent and best_response (same GRUModule architecture)
     agent = GRUModule(
@@ -899,14 +923,17 @@ def main(cfg: DictConfig):
         final_mlp_features=cfg.output_mlp.features,
         action_dim=2
     )
-    best_response = GRUModule(
-        mlp_num_layers=cfg.mlp.num_layers,
-        mlp_features=cfg.mlp.features,
-        gru_hidden_dim=cfg.gru.hidden_dim,
-        final_mlp_num_layers=cfg.output_mlp.num_layers,
-        final_mlp_features=cfg.output_mlp.features,
-        action_dim=2
-    )
+    if cfg.do_self_play:
+        best_response = agent
+    else:
+        best_response = GRUModule(
+            mlp_num_layers=cfg.mlp.num_layers,
+            mlp_features=cfg.mlp.features,
+            gru_hidden_dim=cfg.gru.hidden_dim,
+            final_mlp_num_layers=cfg.output_mlp.num_layers,
+            final_mlp_features=cfg.output_mlp.features,
+            action_dim=2
+        )
 
     # 3) Initialize parameters
     rng = jax.random.PRNGKey(cfg.get("seed", 42))

@@ -7,10 +7,13 @@ gamma: 0.96
 rollout_length: 16
 lam: 0.97
 vf_coef: 0.1
-learning_rate: 1e-5
-tree_lr: 1e-5
+learning_rate: 3e-5
+tree_lr: 3e-5
 num_br_updates: 1
 eval_every: 100
+do_self_play: False
+br_entropy_beta: 0.007
+agent_entropy_beta: 0.007
 
 mlp:
   # for the first MLP
