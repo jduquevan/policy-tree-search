@@ -936,7 +936,7 @@ def main(cfg: DictConfig):
         )
 
     # 3) Initialize parameters
-    rng = jax.random.PRNGKey(cfg.get("seed", 42))
+    rng = jax.random.PRNGKey(cfg.get("seed", cfg.seed))
     x_init = jnp.array([0.0, 0.0]) 
     h_init = jnp.zeros((cfg.gru.hidden_dim,))
     agent_params = agent.init(rng, x_init, h_init)["params"]
