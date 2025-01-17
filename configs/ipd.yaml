@@ -1,11 +1,12 @@
 seed: 42
-batch_size: 10
+batch_size: 128
 input_dim: 5
 frontier_size: 1
 max_tree_depth: 8
 num_iterations: 100000
 gamma: 0.96
 rollout_length: 16
+num_eval_steps: 64
 lam: 0.97
 vf_coef: 0.1
 learning_rate: 3e-5
@@ -13,8 +14,10 @@ tree_lr: 3e-5
 num_br_updates: 3
 eval_every: 100
 do_self_play: False
+use_agent_replay_buffer: False
 br_entropy_beta: 0.007
 agent_entropy_beta: 0.007
+replay_buffer_size: 300
 
 mlp:
   # for the first MLP

@@ -10,14 +10,14 @@ def gen_command(config):
 
 def run_random_job(fake_submit: bool = True):
     hparams = {
-        'learning_rate': [1e-5, 5e-5, 1e-4],
+        'learning_rate': [3e-6, 1e-5, 3e-5, 1e-4, 3e-4],
         'tree_lr': [ 1e-5, 5e-5, 1e-4],
-        'br_entropy_beta': [0.001, 0.005, 0.01, 0.05],
-        'agent_entropy_beta': [0.001, 0.005, 0.01, 0.05],
+        'br_entropy_beta': [0, 0.001, 0.005, 0.01, 0.05],
+        'agent_entropy_beta': [0, 0.001, 0.005, 0.01, 0.05],
         'max_tree_depth': [4, 6, 8],
-        'num_br_updates': [1, 2, 3],
-        'features': [32, 48, 64],
-        'do_self_play': [True, False]
+        'num_br_updates': [1, 2],
+        'features': [32, 48],
+        'do_self_play': [True]
     }
 
     # sample a random config

@@ -2,6 +2,7 @@ import hydra
 import jax
 import jax.numpy as jnp
 import optax
+import random
 import wandb
 
 from flax import linen as nn
@@ -495,7 +496,28 @@ def train_best_response_batched(
 
     return new_br_params, new_opt_state_br, loss_val, metrics
 
-# @partial(jax.jit, static_argnums=(2,3,4))
+def sample_agents_from_replay_buffer(replay_buffer, sample_size, rng_key):
+    """
+    Sample 'sample_size' parameter sets from the replay buffer (list of PyTrees).
+    Returns a single PyTree with shape (sample_size, ...).
+    """
+    if not replay_buffer:
+        raise ValueError("Replay buffer is empty!")
+
+    # For reproducibility using JAX's PRNG, you can use jax.random.randint, etc.
+    # Below is a simple Python-based approach (not strictly reproducible):
+    indices = random.choices(range(len(replay_buffer)), k=sample_size)
+    selected = [replay_buffer[i] for i in indices]
+
+    # Now stack them into a single PyTree of shape (sample_size, ...)
+    def stack_leaves(*xs):
+        return jnp.stack(xs, axis=0)
+
+    # selected is a list of param PyTrees. We can use tree_map with the "stack_leaves" function.
+    batch_pytree = jax.tree_util.tree_map(lambda *xs: stack_leaves(*xs), *selected)
+    return batch_pytree
+
+# @partial(jax.jit, static_argnums=(2,3,4,5,6,7))
 def policy_tree_batched(
     frontier,
     agent_params2,
@@ -534,10 +556,14 @@ def policy_tree_search(
     max_depth     = cfg.max_tree_depth
     num_iters     = cfg.num_iterations
     num_steps     = cfg.rollout_length
+    num_eval_steps= cfg.num_eval_steps
+    use_arb       = cfg.use_agent_replay_buffer
 
     gamma   = cfg.gamma
     lam     = cfg.lam
     vf_coef = cfg.vf_coef
+
+    replay_buffer = []
 
     for iteration in range(num_iters):
         # A) Create the initial frontier
@@ -589,6 +615,30 @@ def policy_tree_search(
             )
             # optional: wandb.log({"br_iter_loss": float(br_loss), "br_iter": br_iter})
 
+        if len(replay_buffer) >= cfg.batch_size and use_arb:
+            current_key, subkey = jax.random.split(current_key)
+            agent_batch = sample_agents_from_replay_buffer(
+                replay_buffer, cfg.batch_size, subkey
+            )
+            (current_br_params,
+             current_opt_state_br,
+             br_loss_replay,
+             br_metrics_replay
+            ) = train_best_response_batched(
+                current_br_params,
+                agent_batch,
+                best_response,
+                agent,
+                current_opt_state_br,
+                optimizer,
+                subkey,
+                num_steps=num_steps,
+                gamma=gamma,
+                lam=lam,
+                vf_coef=vf_coef,
+                br_entropy_beta=cfg.br_entropy_beta,
+            )
+
         # Update global br_params & opt_state_br
         br_params = current_br_params
         opt_state_br = current_opt_state_br
@@ -604,7 +654,7 @@ def policy_tree_search(
             agent,
             best_response,
             eval_key,
-            num_steps
+            num_eval_steps
         )
 
         # E) Pick best policy
@@ -618,12 +668,22 @@ def policy_tree_search(
         # F) Update agent_params => best policy
         agent_params = best_policy
 
+        # Insert into replay buffer most exploiting policy
+        if use_arb:
+            lowest_idx = jnp.argmin(br_returns)
+            lowest_policy = jax.tree_util.tree_map(lambda x: x[lowest_idx], frontier["params1"])
+            highest_policy = jax.tree_util.tree_map(lambda x: x[best_idx], frontier["params1"])
+            replay_buffer.append(lowest_policy)
+            replay_buffer.append(highest_policy)
+            if len(replay_buffer) > cfg.replay_buffer_size:
+                replay_buffer.pop(0)
+
         # Logging
         print(f"[Iter {iteration+1}/{num_iters}] BR loss = {float(br_loss):.4f}, best frontier return = {float(best_return):.4f}")
         wandb.log({
             "iteration": iteration + 1,
             "br_loss": float(br_loss),
-            "best_agent_return": float(best_return),
+            "agent_return": float(best_return),
             "best_response_return": float(best_response_return),
             "agent_entropy": float(agent_entropy),
             "best_response_entropy": float(best_response_entropy),

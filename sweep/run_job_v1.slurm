@@ -15,8 +15,8 @@
 #SBATCH -N 1 #nodes
 #SBATCH -n 1 #tasks
 #SBATCH --mem=40G
-#SBATCH --time=0-00:59:00
-#SBATCH --gres=gpu:a100l:1
+#SBATCH --time=0-00:29:00
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --partition=long
 
 
@@ -30,9 +30,9 @@ export HYDRA_FULL_ERROR=1
 python main.py \
     seed=${1} \
     learning_rate=${2} \
-    tree_lr=${3} \
+    tree_lr=${2} \
     br_entropy_beta=${4} \
-    agent_entropy_beta=${5} \
+    agent_entropy_beta=${4} \
     max_tree_depth=${6} \
     num_br_updates=${7} \
     mlp.features=${8} \
